@@ -1,0 +1,216 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jan  9 11:13:56 2025
+
+@author: xuefei.lu
+"""
+
+#%%
+import os
+path = 'C:\\Users\\xuefei.lu\\OneDrive - SKEMA Business School\\Research\\JBSHAP\\GermanCredit'
+print(path)
+os.chdir(path)
+
+import pickle
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+import tensorflow as tf
+import keras
+from keras.layers import Input, Dense
+from keras.models import Model
+from keras import regularizers
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import JointIndiShapley
+#%% prepare dataset
+def build_dataset(random_seed):
+    dataset = pd.read_csv('german_processed.csv')
+    #gender = dataset['Gender']
+    dataset = dataset.drop(columns = ['PurposeOfLoan','OtherLoansAtStore']) #
+    GoodCustomer = {-1: 0, 1:1}
+    dataset = dataset.replace({'GoodCustomer': GoodCustomer})
+    Gender = {'Female': 0, 'Male':1}
+    dataset = dataset.replace({'Gender': Gender})
+    y_raw = dataset['GoodCustomer']
+    X_raw = dataset.drop(columns = ['GoodCustomer'])
+    
+    Xraw_mean = X_raw.mean()
+    Xraw_std = X_raw.std()
+
+    # normalize data (this is important for model convergence)
+    for k in ['Age','LoanDuration','LoanAmount']:
+        X_raw[k] -= X_raw[k].mean()
+        X_raw[k] /= X_raw[k].std()
+    X_train, X_valid, y_train, y_valid = train_test_split(X_raw, y_raw, test_size=0.2, random_state=random_seed-3)
+    #X_train_IfMale = X_train['Gender']
+    #X_valid_IfMale = X_valid['Gender']
+    #X_train = X_train.drop(columns = ['Gender']) #
+    #X_valid = X_valid.drop(columns = ['Gender']) #
+    dtypes = list(zip(X_train.dtypes.index, map(str, X_train.dtypes)))
+    X_train_array = np.array([X_train[k].values for k,t in dtypes]).T
+    X_valid_array = np.array([X_valid[k].values for k,t in dtypes]).T
+    return X_train, X_valid, y_train, y_valid, X_train_array, X_valid_array, Xraw_mean, Xraw_std
+
+random_seed = 4321
+X_train, X_valid, y_train, y_valid, X_train_array, X_valid_array, Xraw_mean, Xraw_std = build_dataset(random_seed)
+
+#%% Step 1. load probability model
+random_seed = 1234
+def build_prob_model():
+    # build prob_model (ooD detector), which predicts whether x is 1  (on-mainfold) 0 (off-manifold)
+    input_prob = Input(shape=(X_train_array.shape[1],))
+    layer1_prob = Dense(200, activation="relu",kernel_regularizer=regularizers.l1_l2(l1=1e-5, l2=1e-4))(input_prob)
+    layer2_prob = Dense(200, activation="relu",kernel_regularizer=regularizers.l1_l2(l1=1e-5, l2=1e-4))(layer1_prob)
+    layer3_prob = Dense(200, activation="relu",kernel_regularizer=regularizers.l1_l2(l1=1e-5, l2=1e-4))(layer2_prob)
+    out_prob = Dense(1)(layer3_prob)
+
+    model_prob = Model(inputs=input_prob, outputs=[out_prob])
+    opt = keras.optimizers.SGD(learning_rate=1e-3, momentum = 0.9)
+    #model_prob.compile(optimizer=opt, loss='mean_squared_error')
+    loss = tf.keras.losses.BinaryCrossentropy(from_logits=True, label_smoothing=0.1)
+    model_prob.compile(optimizer=opt, loss=loss)
+
+    model_prob.load_weights('./german_prob_model_deep_{}.ckpt'.format(random_seed))
+    return model_prob
+
+model_prob = build_prob_model()
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+ 
+def prob_NCE(x):     #----> calculate prob!
+    h = model_prob.predict(x,verbose=None)
+    G =  np.clip(sigmoid(h),0.01,0.99)
+    return G / (1-G) / 100#17
+
+def pdf(X):
+    return prob_NCE(X).flatten()
+
+# Define threshold as the 5-percentile of likelihood of the training dataset
+threshold = np.percentile(pdf(X_train),5)  
+#%% Build ML model with the CV optimal hyperparameters
+from sklearn.linear_model import  LogisticRegression
+params = {'C': 1,
+ 'class_weight': 'balanced',
+ 'max_iter': 100,
+ 'penalty': 'l2',
+ 'solver': 'liblinear',
+ }
+
+# Configure and train the XGBoost classifier
+log_clf = LogisticRegression(**params, random_state = 77)
+model = log_clf.fit(X_train, y_train)
+
+#%% Import case Mr 227 with infeasible points 
+baseidx = 277
+# load data
+file = open('German_ind_'+ str(baseidx)+'.pkl' ,'rb')
+BJIshapley = pickle.load(file)
+x0 = pickle.load(file)
+CFdf = pickle.load(file)
+BaseShapley = pickle.load(file)
+file.close()
+#%% Table 2: Mr 227 feature values
+stdcolumns = ['Age','LoanDuration','LoanAmount']
+showcolumns = ['LoanDuration','HasTelephone','SavingsAccountBalance_geq_100']
+
+x0_show = x0.copy()
+x0_show.loc[:,stdcolumns] = x0_show.loc[:,stdcolumns]*Xraw_std.loc[stdcolumns]+Xraw_mean[stdcolumns]
+x0_show['Prob of Class 1'] = model.predict_proba(x0)[:,1]
+print(f"Baseline case {baseidx} feature values:\n {x0_show[showcolumns + ['Prob of Class 1']]}") 
+
+
+CFdf_show = CFdf.copy()
+CFdf_show.loc[:,stdcolumns] = CFdf_show.loc[:,stdcolumns]*Xraw_std.loc[stdcolumns]+Xraw_mean[stdcolumns]
+CFdf_show['Prob of Class 1'] = model.predict_proba(CFdf)[:,1]
+print(f"Baseline case {baseidx} feature values:\n {CFdf_show[showcolumns + ['Prob of Class 1']]}") 
+
+#%% Calculate Feasible Shapley
+BJIshapley = pd.DataFrame(np.zeros(CFdf.shape), columns=CFdf.columns)  
+
+def f(X, model = model, pdf = pdf, scoreind = 1, threshold = threshold, x0 = x0):
+    return model.predict_proba(X)[:,scoreind]*(pdf(X)>=threshold)  + model.predict_proba(x0)[:,scoreind]*(pdf(X)<threshold) 
+
+
+calset,U, DXorg, yy, ff, phiorg, ffshape, phishapeid= JointIndiShapley.finitechangesInd(x0,CFdf,f,Torder = 10)
+print('Nr. of Infeasible points: ',str(sum(pdf(DXorg) < threshold)))
+
+BJIshapley.iloc[0,:] = phishapeid.flatten()
+
+InfeasiblePoints = DXorg.loc[pdf(DXorg) < threshold,:].copy()
+InfeasiblePoints['Est density'] = pdf(InfeasiblePoints)
+InfeasiblePoints.loc[:,stdcolumns] = InfeasiblePoints.loc[:,stdcolumns]*Xraw_std.loc[stdcolumns]+Xraw_mean[stdcolumns]
+print(InfeasiblePoints.loc[:,showcolumns + ['Est density']])
+
+#%% rename column names for plots
+rename_dict= {
+    'LoanDuration':'X1',
+    'LoanAmount':'X2', 
+    'LoanRateAsPercentOfIncome':'X3',
+    'YearsAtCurrentHome':'X4',
+    'NumberOfOtherLoansAtBank':'X5', 
+    'NumberOfLiableIndividuals':'X6',
+    'HasTelephone':'X7',
+    'CheckingAccountBalance_geq_0':'X8', 
+    'CheckingAccountBalance_geq_200':'X9',
+    'SavingsAccountBalance_geq_100':'X10', 
+    'SavingsAccountBalance_geq_500':'X11',
+    'MissedPayments':'X12',
+    'NoCurrentLoan':'X13', 
+    'CriticalAccountOrLoansElsewhere':'X14',
+    'OtherLoansAtBank':'X15', 
+    'HasCoapplicant':'X16', 
+    'HasGuarantor':'X17', 
+    'Unemployed':'X18', 
+    'YearsAtCurrentJob_lt_1':'X19',
+    'YearsAtCurrentJob_geq_4':'X20',     
+     'Gender':'X21',
+     'ForeignWorker':'X22', 
+     'Single':'X23', 
+     'Age':'X24', 
+     'OwnsHouse':'X25',
+     'RentsHouse':'X26',
+     'JobClassIsSkilled':'X27'
+    }
+#%% Figure 5 plots
+# (a) Feasible Shapley
+sns.set_theme(style="whitegrid")
+yrange = [0,0.35]
+dfplot = pd.DataFrame(BJIshapley.iloc[0,:]).transpose() 
+refx0 = pd.concat([x0] * CFdf.shape[0], ignore_index=True)
+compareind = refx0 != CFdf
+dfplot = dfplot.loc[:,compareind.iloc[0,:]] 
+# create the bar plot with error bars
+dfplot.rename(columns=rename_dict, inplace=True)
+fig, axes = plt.subplots(1, 1, figsize=(6,4))
+axes = sns.barplot(data=dfplot,ci=95)#ci='sd')
+axes.tick_params(axis='x', labelrotation=0, labelsize=20)
+axes.tick_params(axis='y', labelrotation=0, labelsize=20)
+axes.set_ylim(yrange)
+fig.tight_layout()
+plt.show()
+#plotname = 'German_ind'+str(baseidx)+'.pdf'
+#plt.savefig(plotname, format="pdf", bbox_inches="tight")
+
+# (b) Baseline (Free) Shapley
+refx0 = pd.concat([x0] * CFdf.shape[0], ignore_index=True)
+compareind = refx0 != CFdf
+
+dfplot = pd.DataFrame(BaseShapley.iloc[0,:]).transpose() 
+dfplot = dfplot.loc[:,compareind.iloc[0,:]] #features_to_vary]
+dfplot.rename(columns=rename_dict, inplace=True)
+
+fig, axes = plt.subplots(1, 1, figsize=(6,4))
+sns.set_theme(style="whitegrid")
+axes = sns.barplot(data=dfplot,ci=95)#ci='sd')
+axes.tick_params(axis='x', labelrotation=0, labelsize=20)
+axes.tick_params(axis='y', labelrotation=0, labelsize=20)
+axes.set_ylim(yrange)
+fig.tight_layout()
+plt.show()
+#plotname = 'German_ind'+str(baseidx)+'OrgBase.pdf'
+#plt.savefig(plotname, format="pdf", bbox_inches="tight")
